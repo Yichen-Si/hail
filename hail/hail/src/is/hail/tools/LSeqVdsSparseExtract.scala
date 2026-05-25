@@ -44,6 +44,7 @@ object LSeqVdsSparseExtract {
     vatSummaryColPrefix: Option[String] = None,
     minMAC: Int = 20,
     maxMAF: Double = 1.0,
+    maxMissing: Double = 1.0,
     outPrefix: Option[String] = None,
     limitRows: Int = 0,
     inspectOnly: Boolean = false,
@@ -146,6 +147,8 @@ object LSeqVdsSparseExtract {
       if (n <= 0)
         usage("--threads must be > 0")
     }
+    if (config.maxMissing < 0.0 || config.maxMissing > 1.0)
+      usage("--max-missing must be between 0 and 1")
     if (config.chunkBp.nonEmpty && config.limitRows > 0)
       usage("--limit-rows is not supported with --chunk-bp")
     if (config.chunkBp.nonEmpty && !config.inspectOnly && config.outPrefix.isEmpty)
@@ -160,7 +163,8 @@ object LSeqVdsSparseExtract {
 
       val retained = config.vat match {
         case Some(path) =>
-          val result = readVat(fs, path, config)
+          val selectedSampleCount = selectedSampleIndices.map(_.length).getOrElse(spec.colsSpec.partitionCounts.sum.toInt)
+          val result = readVat(fs, path, config, selectedSampleCount)
           println(s"qualified VAT rows: ${result.qualifiedRows}")
           println(s"retained unique VAT alleles: ${result.retainedByAllele.size}")
           println(s"duplicate qualified VAT rows: ${result.duplicateRows}")
@@ -254,6 +258,7 @@ object LSeqVdsSparseExtract {
         case "--min-mac" => c = c.copy(minMAC = needValue(args(i)).toInt)
         case "--max-af" => c = c.copy(maxMAF = needValue(args(i)).toDouble)
         case "--max-maf" => c = c.copy(maxMAF = needValue(args(i)).toDouble)
+        case "--max-missing" => c = c.copy(maxMissing = needValue(args(i)).toDouble)
         case "--out-prefix" => c = c.copy(outPrefix = Some(needValue(args(i))))
         case "--limit-rows" => c = c.copy(limitRows = needValue(args(i)).toInt)
         case "--inspect-only" => c = c.copy(inspectOnly = true)
@@ -286,7 +291,7 @@ object LSeqVdsSparseExtract {
         |  [--col-ac gvs_all_ac] [--col-an gvs_all_an] \
         |  [--col-af gvs_all_af] [--col-sc gvs_all_sc] \
         |  [--vat-summary-col-prefix PREFIX] \
-        |  [--min-mac 20] [--max-maf 1.0] [--out-prefix PATH] \
+        |  [--min-mac 20] [--max-maf 1.0] [--max-missing 1.0] [--out-prefix PATH] \
         |  [--limit-rows N] [--inspect-only] [--sample-list PATH] [--sample-index-list PATH] [--sample-col N] \
         |  [--chunk-bp N] [--threads N] \
         |  [--gcs-requester-pays-project PROJECT] [--gcs-requester-pays-buckets BUCKET[,BUCKET...]]
@@ -296,6 +301,8 @@ object LSeqVdsSparseExtract {
         |  AF is derived as AC / AN from --col-ac and --col-an.
         |  A VAT row passes when min(AC, AN - AC) >= min_mac
         |  and min(AC / AN, 1 - AC / AN) <= max_maf.
+        |  If --max-missing is set below 1, AN must be at least
+        |  (1 - max_missing) * 2 * selected_sample_count.
         |  The AF column is written to the sidecar if present, but is not used for filtering.
         |
         |Sample filtering:
@@ -399,7 +406,12 @@ object LSeqVdsSparseExtract {
     println(s"path exists: ${fs.isDir(path)}")
   }
 
-  private def readVat(fs: FS, path: String, config: Config): VatReadResult = {
+  private def readVat(
+    fs: FS,
+    path: String,
+    config: Config,
+    selectedSampleCount: Int,
+  ): VatReadResult = {
     using(Source.fromInputStream(fs.open(path))) { src =>
       val it = src.getLines()
       if (!it.hasNext)
@@ -425,6 +437,7 @@ object LSeqVdsSparseExtract {
 
       val retained = mutable.LinkedHashMap.empty[VariantKey, VariantInfo]
       val duplicatedKeys = mutable.HashSet.empty[VariantKey]
+      val minAn = math.ceil((1.0 - config.maxMissing) * 2.0 * selectedSampleCount).toInt
       var qualifiedRows = 0L
       var duplicateRows = 0L
       for (line <- it) {
@@ -438,7 +451,7 @@ object LSeqVdsSparseExtract {
             val outputAf = afIdx.map(i => parseDoubleOrZero(fields(i))).getOrElse(af)
             val mac = math.min(ac, math.max(0, an - ac))
             val maf = math.min(af, 1.0 - af)
-            if (mac >= config.minMAC && maf <= config.maxMAF) {
+            if (an >= minAn && mac >= config.minMAC && maf <= config.maxMAF) {
               qualifiedRows += 1
               val key = VariantKey(fields(contigIdx), pos, fields(refIdx), fields(altIdx))
               if (!retained.contains(key)) {
@@ -1104,9 +1117,10 @@ object LSeqVdsSparseExtract {
         os.write(header.getBytes("UTF-8"))
         retained.values.toIndexedSeq.sortBy(_.index).foreach { info =>
           variantCounts.get(info.index).foreach { counts =>
-            val eventMac = counts.het + 2 * counts.hom
-            if (eventMac > 0) {
+            val eventAlleleCount = counts.het + 2 * counts.hom
+            if (eventAlleleCount > 0 && eventAlleleCount <= info.an) {
               val k = info.key
+              val eventMac = math.min(eventAlleleCount, math.max(0, info.an - eventAlleleCount))
               val eventMaf = if (info.an == 0) 0.0 else eventMac.toDouble / info.an.toDouble
               val minorAllele = if (info.minorAlleleIndex == 0) "ref" else "alt"
               val line =

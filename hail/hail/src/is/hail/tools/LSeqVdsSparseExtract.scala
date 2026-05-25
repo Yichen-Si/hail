@@ -136,11 +136,10 @@ object LSeqVdsSparseExtract {
       if (bp <= 0)
         usage("--chunk-bp must be > 0")
       val startAligned = (config.start - 1) % bp == 0
-      val endAligned = (config.end - config.start + 1) % bp == 0
-      if (!startAligned || !endAligned)
+      if (!startAligned)
         usage(
-          s"with --chunk-bp $bp, --start/--end must describe complete physical chunks: " +
-            s"start must be chunk_id * chunk_bp + 1 and inclusive end must be start + N * chunk_bp - 1"
+          s"with --chunk-bp $bp, --start must be chunk_id * chunk_bp + 1; " +
+            s"--end may stop at the end of a full chunk or at a shorter terminal chunk"
         )
     }
     config.threads.foreach { n =>
@@ -316,8 +315,9 @@ object LSeqVdsSparseExtract {
         |  either sample list format. Default: 0.
         |
         |Chunking:
-        |  --chunk-bp requires --start/--end to cover complete physical chunks:
-        |  start = chunk_id * chunk_bp + 1 and end = start + N * chunk_bp - 1.
+        |  --chunk-bp requires --start to be chunk-aligned:
+        |  start = chunk_id * chunk_bp + 1. The final chunk may be shorter
+        |  than chunk_bp, for example at the end of a chromosome.
         |
         |GCS requester pays:
         |  --gcs-requester-pays-project defaults to GCS_REQUESTER_PAYS_PROJECT,
@@ -610,7 +610,8 @@ object LSeqVdsSparseExtract {
     var chunkStart = chunkId * chunkBp + 1
     while (chunkStart < endExclusive) {
       val chunkEnd = chunkStart + chunkBp
-      b += Chunk(chunkId, chunkStart, chunkEnd, chunkStart, chunkEnd)
+      val queryEnd = math.min(chunkEnd, endExclusive)
+      b += Chunk(chunkId, chunkStart, chunkEnd, chunkStart, queryEnd)
       chunkId += 1
       chunkStart = chunkId * chunkBp + 1
     }

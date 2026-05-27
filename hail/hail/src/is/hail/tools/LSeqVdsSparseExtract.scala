@@ -651,56 +651,271 @@ object LSeqVdsSparseExtract {
   ): ExtractStats = {
     val threads = config.threads.getOrElse(availableThreads())
     println(s"chunked mode: ${chunks.length} chunks, $threads worker threads")
-    val executor = Executors.newFixedThreadPool(threads)
     val basePrefix = config.outPrefix.get
     val noVatFilter = config.vat.isEmpty
-    try {
-      val futures = chunks.map { chunk =>
-        executor.submit(new Callable[ChunkResult] {
-          override def call(): ChunkResult = {
-            val selected = selectedPartitionRange(ctx, spec, config.chrom, chunk.queryStart, chunk.queryEnd)
-            val chunkRetained =
-              if (noVatFilter) retained else variantsInInterval(retained, chunk.queryStart, chunk.queryEnd)
-            val prefix = chunkOutputPrefix(basePrefix, config.chrom, chunk)
-            val stats = scanVariantData(
-              ctx,
-              variantPath,
-              spec,
-              config,
-              chunkRetained,
-              selectedSampleIndices,
-              chunk.queryStart,
-              chunk.queryEnd,
-              chunk.start,
-              chunk.end,
-              selected,
-              Some(prefix),
-              0,
-              new HailClassLoader(getClass.getClassLoader),
-              noVatFilter,
-            )
-            ChunkResult(chunk, stats)
-          }
-        })
-      }
-      val results =
-        try futures.map(_.get()).sortBy(_.chunk.index)
-        catch {
-          case t: Throwable =>
-            executor.shutdownNow()
-            throw t
+    val selectedByChunk =
+      chunks.map(chunk => selectedPartitionRange(ctx, spec, config.chrom, chunk.queryStart, chunk.queryEnd))
+
+    if (threads > 1) {
+      val executor = Executors.newFixedThreadPool(threads)
+      try {
+        val futures = chunks.zip(selectedByChunk).map { case (chunk, selected) =>
+          executor.submit(new Callable[ChunkResult] {
+            override def call(): ChunkResult = {
+              val chunkRetained =
+                if (noVatFilter) retained else variantsInInterval(retained, chunk.queryStart, chunk.queryEnd)
+              val prefix = chunkOutputPrefix(basePrefix, config.chrom, chunk)
+              val stats = scanVariantData(
+                ctx,
+                variantPath,
+                spec,
+                config,
+                chunkRetained,
+                selectedSampleIndices,
+                chunk.queryStart,
+                chunk.queryEnd,
+                chunk.start,
+                chunk.end,
+                selected,
+                Some(prefix),
+                0,
+                new HailClassLoader(getClass.getClassLoader),
+                noVatFilter,
+              )
+              ChunkResult(chunk, stats)
+            }
+          })
         }
-      results.foreach { r =>
-        val c = r.chunk
-        val s = r.stats
+        val results =
+          try futures.map(_.get()).sortBy(_.chunk.index)
+          catch {
+            case t: Throwable =>
+              executor.shutdownNow()
+              throw t
+          }
+        results.foreach { r =>
+          val c = r.chunk
+          val s = r.stats
+          println(
+            s"chunk ${c.index} ${c.start}-${c.end - 1}: rows_read=${s.rowsRead}, rows_in_interval=${s.rowsInInterval}, " +
+              s"retained_variant_rows=${s.retainedVariantRows}, defined_entry_elements=${s.definedEntries}, carrier_events=${s.carrierEvents}"
+          )
+        }
+        results.foldLeft(ExtractStats(0L, 0L, 0L, 0L, 0L)) { case (acc, r) => addStats(acc, r.stats) }
+      } finally {
+        executor.shutdown()
+      }
+    } else {
+      println("chunked mode: single worker thread; scanning shared partition range once")
+    val selected = selectedPartitionRange(ctx, spec, config.chrom, chunks.head.queryStart, chunks.last.queryEnd)
+    val statsByChunk = Array.fill(chunks.length)(ExtractStats(0L, 0L, 0L, 0L, 0L))
+    val retainedByChunk =
+      chunks.map(chunk =>
+        if (noVatFilter) retained else variantsInInterval(retained, chunk.queryStart, chunk.queryEnd)
+      ).toArray
+    val variantCountsByChunk = Array.fill(chunks.length)(mutable.HashMap.empty[Int, VariantCounts])
+    val prefixesByChunk = chunks.map(chunk => chunkOutputPrefix(basePrefix, config.chrom, chunk)).toArray
+
+    def chunkIndexForPosition(pos: Int): Int = {
+      val firstChunkId = chunks.head.index
+      val chunkBp = config.chunkBp.get
+      val i = (pos - chunks.head.start) / chunkBp
+      if (i < 0 || i >= chunks.length) {
+        -1
+      } else if (chunks(i).index == firstChunkId + i && pos >= chunks(i).queryStart && pos < chunks(i).queryEnd) {
+        i
+      } else {
+        chunks.indexWhere(chunk => pos >= chunk.queryStart && pos < chunk.queryEnd)
+      }
+    }
+
+    val rowTablePath = variantPath + "/rows"
+    val entryTablePath = variantPath + "/entries"
+    val rowRvdPath = spec.rowsSpec.rowsComponent.absolutePath(rowTablePath)
+    val entryRvdPath = spec.entriesSpec.rowsComponent.absolutePath(entryTablePath)
+    val rowPartPaths = spec.rowsSpec.rowsSpec.absolutePartPaths(rowRvdPath)
+    val entryPartPaths = spec.entriesSpec.rowsSpec.absolutePartPaths(entryRvdPath)
+    if (rowPartPaths.length != entryPartPaths.length)
+      fatal(s"row and entry partition counts differ: ${rowPartPaths.length} vs ${entryPartPaths.length}")
+    println(
+      s"selected row/entry partitions: ${selected.start}..${selected.end - 1} (${selected.length})"
+    )
+
+    val rowRequestedType = spec.rowsSpec.table_type.rowType
+    val entryRequestedType = spec.entriesSpec.table_type.rowType
+    val (rowPType0, rowDecoderFactory) =
+      spec.rowsSpec.rowsSpec.typedCodecSpec.buildDecoder(ctx, rowRequestedType)
+    val (entryPType0, entryDecoderFactory) =
+      spec.entriesSpec.rowsSpec.typedCodecSpec.buildDecoder(ctx, entryRequestedType)
+    val rowPType = rowPType0.asInstanceOf[PStruct]
+    val entryRowPType = entryPType0.asInstanceOf[PStruct]
+    val locusIdx = rowPType.fieldIdx.getOrElse("locus", fatal("row schema has no locus field"))
+    val allelesIdx = rowPType.fieldIdx.getOrElse("alleles", fatal("row schema has no alleles field"))
+    val locusType = rowPType.types(locusIdx).asInstanceOf[PLocus]
+    val allelesType = rowPType.types(allelesIdx).asInstanceOf[PArray]
+    val entriesIdx =
+      entryRowPType.fieldIdx.getOrElse(
+        MatrixType.entriesIdentifier,
+        fatal(s"entry row schema has no '${MatrixType.entriesIdentifier}' field"),
+      )
+    val entriesType = entryRowPType.types(entriesIdx).asInstanceOf[PArray]
+    val entryElementType = entriesType.elementType.asInstanceOf[PStruct]
+    val gtField = entryElementType.fieldIdx.get("GT").map("GT" -> _)
+      .orElse(entryElementType.fieldIdx.get("LGT").map("LGT" -> _))
+    val laField = entryElementType.fieldIdx.get("LA")
+
+    val carrierUniverseSize = spec.colsSpec.partitionCounts.sum.toInt
+    val selectedSampleCount = selectedSampleIndices.map(_.length).getOrElse(carrierUniverseSize)
+    val eventOutByChunk = chunks.map { chunk =>
+      val out = new DataOutputStream(new BufferedOutputStream(ctx.fs.create(chunkOutputPrefix(basePrefix, config.chrom, chunk) + ".events.bin")))
+      writeEventHeader(
+        out,
+        config.chrom,
+        chunk.start,
+        chunk.end - 1,
+        carrierUniverseSize,
+        selectedSampleCount,
+        config.chunkBp.getOrElse(0),
+      )
+      out
+    }.toArray
+
+    var rowsRead = 0L
+    try {
+      var p = selected.start
+      var done = false
+      val intervalStart = chunks.head.queryStart
+      val intervalEnd = chunks.last.queryEnd
+      RegionPool.scoped { pool =>
+        while (p < selected.end && !done) {
+          pool.scopedRegion { region =>
+            using(openNativeRows(ctx.fs, rowPartPaths(p), rowDecoderFactory, ctx.theHailClassLoader, region)) {
+            rowStream =>
+              using(openNativeRows(
+                ctx.fs,
+                entryPartPaths(p),
+                entryDecoderFactory,
+                ctx.theHailClassLoader,
+                region,
+              )) { entryStream =>
+                var continue = true
+                while (continue) {
+                  region.clear()
+                  val rowOffset = rowStream.nextOffset()
+                  val entryOffset = entryStream.nextOffset()
+                  if (rowOffset == 0L || entryOffset == 0L) {
+                    if (rowOffset != entryOffset)
+                      fatal(s"row/entry partition ended at different records in partition $p")
+                    continue = false
+                  } else {
+                    rowsRead += 1
+                    val locusOffset = rowPType.loadField(rowOffset, locusIdx)
+                    val contig = locusType.contig(locusOffset)
+                    val position = locusType.position(locusOffset)
+                    if (contig == config.chrom && position >= intervalEnd) {
+                      done = true
+                      continue = false
+                    } else if (contig == config.chrom && position >= intervalStart && position < intervalEnd) {
+                      val chunkI = chunkIndexForPosition(position)
+                      if (chunkI >= 0) {
+                        val allelesOffset = rowPType.loadField(rowOffset, allelesIdx)
+                        val alleles = unsafeStringArray(allelesType, allelesOffset)
+                        val variantInfoByAllele = alleleVariantInfo(contig, position, alleles, retainedByChunk(chunkI))
+                        var chunkStats = statsByChunk(chunkI)
+                        chunkStats = chunkStats.copy(rowsInInterval = chunkStats.rowsInInterval + 1L)
+                        if (noVatFilter || variantInfoByAllele.nonEmpty) {
+                          chunkStats = chunkStats.copy(retainedVariantRows = chunkStats.retainedVariantRows + 1L)
+                          val entriesOffset = entryRowPType.loadField(entryOffset, entriesIdx)
+                          val sampleCount = entriesType.loadLength(entriesOffset)
+                          selectedSampleIndices match {
+                            case Some(indices) =>
+                              var i = 0
+                              while (i < indices.length) {
+                                val sampleIndex = indices(i)
+                                if (sampleIndex < sampleCount) {
+                                  val events = processEntry(
+                                    entriesType,
+                                    entryElementType,
+                                    gtField,
+                                    laField,
+                                    Some(eventOutByChunk(chunkI)),
+                                    variantCountsByChunk(chunkI),
+                                    variantInfoByAllele,
+                                    noVatFilter,
+                                    entriesOffset,
+                                    sampleCount,
+                                    sampleIndex,
+                                  )
+                                  if (events >= 0) {
+                                    chunkStats = chunkStats.copy(
+                                      definedEntries = chunkStats.definedEntries + 1L,
+                                      carrierEvents = chunkStats.carrierEvents + events,
+                                    )
+                                  }
+                                }
+                                i += 1
+                              }
+                            case None =>
+                              var sampleIndex = 0
+                              while (sampleIndex < sampleCount) {
+                                val events = processEntry(
+                                  entriesType,
+                                  entryElementType,
+                                  gtField,
+                                  laField,
+                                  Some(eventOutByChunk(chunkI)),
+                                  variantCountsByChunk(chunkI),
+                                  variantInfoByAllele,
+                                  noVatFilter,
+                                  entriesOffset,
+                                  sampleCount,
+                                  sampleIndex,
+                                )
+                                if (events >= 0) {
+                                  chunkStats = chunkStats.copy(
+                                    definedEntries = chunkStats.definedEntries + 1L,
+                                    carrierEvents = chunkStats.carrierEvents + events,
+                                  )
+                                }
+                                sampleIndex += 1
+                              }
+                          }
+                        }
+                        statsByChunk(chunkI) = chunkStats
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          p += 1
+        }
+      }
+    } finally {
+      eventOutByChunk.foreach(_.close())
+    }
+
+    chunks.indices.foreach { i =>
+      writeVariants(ctx.fs, Some(prefixesByChunk(i)), retainedByChunk(i), variantCountsByChunk(i))
+    }
+
+    val results = chunks.indices.map { i =>
+      val chunkStats = statsByChunk(i).copy(rowsRead = rowsRead)
+      ChunkResult(chunks(i), chunkStats)
+    }
+    results.foreach { r =>
+      val c = r.chunk
+      val s = r.stats
         println(
           s"chunk ${c.index} ${c.start}-${c.end - 1}: rows_read=${s.rowsRead}, rows_in_interval=${s.rowsInInterval}, " +
             s"retained_variant_rows=${s.retainedVariantRows}, defined_entry_elements=${s.definedEntries}, carrier_events=${s.carrierEvents}"
         )
-      }
-      results.foldLeft(ExtractStats(0L, 0L, 0L, 0L, 0L)) { case (acc, r) => addStats(acc, r.stats) }
-    } finally {
-      executor.shutdown()
+    }
+    val chunkTotals = results.foldLeft(ExtractStats(0L, 0L, 0L, 0L, 0L)) { case (acc, r) =>
+      addStats(acc, r.stats.copy(rowsRead = 0L))
+    }
+    chunkTotals.copy(rowsRead = rowsRead)
     }
   }
 
@@ -1119,9 +1334,10 @@ object LSeqVdsSparseExtract {
         retained.values.toIndexedSeq.sortBy(_.index).foreach { info =>
           variantCounts.get(info.index).foreach { counts =>
             val eventAlleleCount = counts.het + 2 * counts.hom
-            if (eventAlleleCount > 0 && eventAlleleCount <= info.an) {
+            if (eventAlleleCount > 0) {
               val k = info.key
-              val eventMac = math.min(eventAlleleCount, math.max(0, info.an - eventAlleleCount))
+              val boundedEventAlleleCount = math.min(eventAlleleCount, info.an)
+              val eventMac = math.min(boundedEventAlleleCount, math.max(0, info.an - boundedEventAlleleCount))
               val eventMaf = if (info.an == 0) 0.0 else eventMac.toDouble / info.an.toDouble
               val minorAllele = if (info.minorAlleleIndex == 0) "ref" else "alt"
               val line =

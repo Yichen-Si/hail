@@ -44,7 +44,27 @@ object LSeqVdsSparseExtract {
     vatSummaryColPrefix: Option[String] = None,
     minMAC: Int = 20,
     maxMAF: Double = 1.0,
-    maxMissing: Double = 1.0,
+    // Upper bound on the VAT's ancestry-specific MINOR allele count, 0 = off.
+    // Preferred over --max-maf for capping the VDS side to the pgen's
+    // complement: the ancestry labels behind the VAT summary columns do not
+    // match our analysis cohort, so ac/an/sc are only ROUGH BOUNDS. --max-maf
+    // divides one untrusted number by another; this bound touches only ac, and
+    // the exact ceiling is enforced downstream on event-derived counts in
+    // transpose-vds. Set it with margin (250 to target an exact 200).
+    maxVatAC: Int = 0,
+    // Ancestry-free AN column, used for the missingness bound. Preferred over the
+    // ancestry-specific AN because the VAT's ancestry labels do not match the
+    // analysis cohort, while the VDS column count N is known exactly:
+    //   missing_rate = (2N - gvs_all_an) / 2N
+    colAllAn: String = "gvs_all_an",
+    // gnomAD allele count for the population matching this ancestry, passed
+    // through to the .variants.tsv sidecar so the converter can apply the
+    // TOPMed-or-gnomAD rule without a second pass over the VAT. NOTE the label
+    // map is not the identity: AoU eur -> gnomad_nfe, and there is no
+    // gnomad_eur_* column at all.
+    colGnomadAc: String = "",
+    colGnomadFailed: String = "gnomad_failed_filter",
+    maxMissing: Double = 0.05,
     outPrefix: Option[String] = None,
     limitRows: Int = 0,
     inspectOnly: Boolean = false,
@@ -69,6 +89,8 @@ object LSeqVdsSparseExtract {
     maf: Double,
     sc: Int,
     minorAlleleIndex: Int,
+    gnomadAc: Int,
+    gnomadFailed: Boolean,
   )
 
   private final case class VatReadResult(
@@ -162,8 +184,10 @@ object LSeqVdsSparseExtract {
 
       val retained = config.vat match {
         case Some(path) =>
-          val selectedSampleCount = selectedSampleIndices.map(_.length).getOrElse(spec.colsSpec.partitionCounts.sum.toInt)
-          val result = readVat(fs, path, config, selectedSampleCount)
+          // N for the missingness bound is the TOTAL VDS column count, not the
+          // selected subset: gvs_all_an is computed over the whole callset.
+          val vdsSampleCount = spec.colsSpec.partitionCounts.sum.toInt
+          val result = readVat(fs, path, config, vdsSampleCount)
           println(s"qualified VAT rows: ${result.qualifiedRows}")
           println(s"retained unique VAT alleles: ${result.retainedByAllele.size}")
           println(s"duplicate qualified VAT rows: ${result.duplicateRows}")
@@ -218,6 +242,16 @@ object LSeqVdsSparseExtract {
         println(s"carrier events written: ${stats.carrierEvents}")
       }
     }
+    // Hail's LocalBackend leaves non-daemon threads alive, so returning from
+    // main does not end the process: it idles at 0% CPU indefinitely after every
+    // output has been written and flushed. Exit explicitly.
+    //
+    // Observed on a completed 1 Mb run: all 10 chunks written and all summaries
+    // printed, then 19 minutes of idling until killed. Inside vds2gtx.run.sh --
+    // which invokes this and then proceeds to transpose-vds under `set -e` with
+    // no timeout -- that would consume the whole dsub timeout and be recorded as
+    // a job failure despite the output being correct.
+    System.exit(0)
   }
 
   private def parseArgs(args: IndexedSeq[String]): Config = {
@@ -257,6 +291,10 @@ object LSeqVdsSparseExtract {
         case "--min-mac" => c = c.copy(minMAC = needValue(args(i)).toInt)
         case "--max-af" => c = c.copy(maxMAF = needValue(args(i)).toDouble)
         case "--max-maf" => c = c.copy(maxMAF = needValue(args(i)).toDouble)
+        case "--max-vat-ac" => c = c.copy(maxVatAC = needValue(args(i)).toInt)
+        case "--all-an-col" => c = c.copy(colAllAn = needValue(args(i)))
+        case "--gnomad-ac-col" => c = c.copy(colGnomadAc = needValue(args(i)))
+        case "--gnomad-failed-col" => c = c.copy(colGnomadFailed = needValue(args(i)))
         case "--max-missing" => c = c.copy(maxMissing = needValue(args(i)).toDouble)
         case "--out-prefix" => c = c.copy(outPrefix = Some(needValue(args(i))))
         case "--limit-rows" => c = c.copy(limitRows = needValue(args(i)).toInt)
@@ -290,7 +328,7 @@ object LSeqVdsSparseExtract {
         |  [--col-ac gvs_all_ac] [--col-an gvs_all_an] \
         |  [--col-af gvs_all_af] [--col-sc gvs_all_sc] \
         |  [--vat-summary-col-prefix PREFIX] \
-        |  [--min-mac 20] [--max-maf 1.0] [--max-missing 1.0] [--out-prefix PATH] \
+        |  [--min-mac 20] [--max-maf 1.0] [--max-vat-ac 0] [--max-missing 0.05] [--out-prefix PATH] \
         |  [--limit-rows N] [--inspect-only] [--sample-list PATH] [--sample-index-list PATH] [--sample-col N] \
         |  [--chunk-bp N] [--threads N] \
         |  [--gcs-requester-pays-project PROJECT] [--gcs-requester-pays-buckets BUCKET[,BUCKET...]]
@@ -299,10 +337,31 @@ object LSeqVdsSparseExtract {
         |  --start and --end are both inclusive.
         |  AF is derived as AC / AN from --col-ac and --col-an.
         |  A VAT row passes when min(AC, AN - AC) >= min_mac
-        |  and min(AC / AN, 1 - AC / AN) <= max_maf.
-        |  If --max-missing is set below 1, AN must be at least
-        |  (1 - max_missing) * 2 * selected_sample_count.
+        |  and min(AC / AN, 1 - AC / AN) <= max_maf
+        |  and, when --max-vat-ac > 0, min(AC, AN - AC) <= max_vat_ac.
+        |  --all-an-col names the ancestry-free AN column (default gvs_all_an).
+        |  Missingness uses it (not the ancestry-specific AN)
+        |  against the exact total VDS column count N:
+        |      missing_rate = (2N - gvs_all_an) / (2N) <= max_missing
+        |  so it needs no ancestry-specific sample size and is not affected by the
+        |  ancestry-label mismatch. Default max_missing 0.05.
         |  The AF column is written to the sidecar if present, but is not used for filtering.
+        |
+        |  CAUTION: the ancestry-specific AC/AN/SC summary columns are computed over
+        |  AoU's own ancestry labels, which do NOT match the analysis cohort, so every
+        |  filter here is approximate and must be treated as a ROUGH BOUND only. Use
+        |  --max-vat-ac with margin (250 to target an exact 200) and enforce the exact
+        |  ceiling downstream on event-derived counts. Prefer it over --max-maf, which
+        |  divides one untrusted column by another. The .variants.tsv sidecar keeps the
+        |  distinction visible: its mac/maf columns are EVENT-derived, its ac/an/af/sc
+        |  columns are copied from the VAT.
+        |
+        |  --gnomad-ac-col names the gnomAD AC column for the population matching this
+        |  ancestry; it is copied to the sidecar as `gnomad_ac` and is NOT filtered on
+        |  here, because the rule that uses it depends on the event-derived MAF. The
+        |  label map is not the identity -- AoU eur -> gnomad_nfe, and there is no
+        |  gnomad_eur_* column. --gnomad-failed-col (default gnomad_failed_filter) is
+        |  copied as `gnomad_failed`; that column is blank or "true", never "false".
         |
         |Sample filtering:
         |  --sample-list is a plain text file. The first whitespace-delimited token
@@ -329,7 +388,9 @@ object LSeqVdsSparseExtract {
         |  PATH.events.bin: LSQ1 metadata header, then repeated
         |                   int variant_index, int sample_index, byte dosage, int sc
         |  PATH.variants.tsv: variant_index, contig, position, ref, alt, minor_allele,
-        |                     ac, an, af, mac, maf, sc
+        |                     ac, an, af, mac, maf, sc, gnomad_ac, gnomad_failed
+        |                     mac/maf are EVENT-derived; ac/an/af/sc and the gnomad
+        |                     columns are copied from the VAT
         |""".stripMargin)
     sys.exit(1)
   }
@@ -410,7 +471,7 @@ object LSeqVdsSparseExtract {
     fs: FS,
     path: String,
     config: Config,
-    selectedSampleCount: Int,
+    vdsSampleCount: Int,
   ): VatReadResult = {
     using(Source.fromInputStream(fs.open(path))) { src =>
       val it = src.getLines()
@@ -428,16 +489,27 @@ object LSeqVdsSparseExtract {
       val anIdx = idx(config.colAN)
       val afIdx = header.get(config.colAF)
       val scIdx = idx(config.colSC)
-      val maxRequiredIdx = Seq(contigIdx, posIdx, refIdx, altIdx, acIdx, anIdx, scIdx).max
+      val allAnIdx = idx(config.colAllAn)
+      val gnomadAcIdx = if (config.colGnomadAc.isEmpty) None else Some(idx(config.colGnomadAc))
+      val gnomadFailedIdx = header.get(config.colGnomadFailed)
+      val maxRequiredIdx =
+        (Seq(contigIdx, posIdx, refIdx, altIdx, acIdx, anIdx, scIdx, allAnIdx) ++
+          gnomadAcIdx.toSeq ++ gnomadFailedIdx.toSeq).max
 
       println(
         s"VAT columns: contig=${config.colContig}, position=${config.colPosition}, ref=${config.colRef}, alt=${config.colAlt}, " +
-          s"ac=${config.colAC}, an=${config.colAN}, af=${config.colAF}, sc=${config.colSC}"
+          s"ac=${config.colAC}, an=${config.colAN}, af=${config.colAF}, sc=${config.colSC}, " +
+          s"all_an=${config.colAllAn}, gnomad_ac=${if (config.colGnomadAc.isEmpty) "<none>" else config.colGnomadAc}, " +
+          s"gnomad_failed=${config.colGnomadFailed}"
       )
 
       val retained = mutable.LinkedHashMap.empty[VariantKey, VariantInfo]
       val duplicatedKeys = mutable.HashSet.empty[VariantKey]
-      val minAn = math.ceil((1.0 - config.maxMissing) * 2.0 * selectedSampleCount).toInt
+      // Missingness is measured on the ANCESTRY-FREE gvs_all_an against the exact
+      // VDS column count, so it needs no ancestry-specific sample size:
+      //   missing_rate = (2N - gvs_all_an) / 2N <= maxMissing
+      // i.e. gvs_all_an >= (1 - maxMissing) * 2N.
+      val minAllAn = math.ceil((1.0 - config.maxMissing) * 2.0 * vdsSampleCount).toInt
       var qualifiedRows = 0L
       var duplicateRows = 0L
       for (line <- it) {
@@ -451,12 +523,22 @@ object LSeqVdsSparseExtract {
             val outputAf = afIdx.map(i => parseDoubleOrZero(fields(i))).getOrElse(af)
             val mac = math.min(ac, math.max(0, an - ac))
             val maf = math.min(af, 1.0 - af)
-            if (an >= minAn && mac >= config.minMAC && maf <= config.maxMAF) {
+            // mac, not ac: for the ALT-minor alleles the VDS side keeps they are
+            // the same number, and for a REF-minor row ac is the ALT count and
+            // would spuriously exceed any minor-allele ceiling.
+            val vatAcOk = config.maxVatAC <= 0 || mac <= config.maxVatAC
+            val allAn = parseIntOrZero(fields(allAnIdx))
+            if (allAn >= minAllAn && mac >= config.minMAC && maf <= config.maxMAF && vatAcOk) {
               qualifiedRows += 1
               val key = VariantKey(fields(contigIdx), pos, fields(refIdx), fields(altIdx))
               if (!retained.contains(key)) {
                 val sc = parseIntOrZero(fields(scIdx))
                 val minorAlleleIndex = if (ac == mac) 1 else 0
+                val gnomadAc = gnomadAcIdx.map(i => parseIntOrZero(fields(i))).getOrElse(0)
+                // gnomad_failed_filter is blank or "true"; it is never "false",
+                // so the test is != "true", not == "false".
+                val gnomadFailed =
+                  gnomadFailedIdx.exists(i => i < fields.length && fields(i) == "true")
                 retained += key -> VariantInfo(
                   retained.size,
                   key,
@@ -467,6 +549,8 @@ object LSeqVdsSparseExtract {
                   maf,
                   sc,
                   minorAlleleIndex,
+                  gnomadAc,
+                  gnomadFailed,
                 )
               } else {
                 duplicateRows += 1
@@ -522,7 +606,10 @@ object LSeqVdsSparseExtract {
     using(Source.fromInputStream(fs.open(path))) { src =>
       src.getLines().foreach { line =>
         val trimmed = line.trim
-        if (trimmed.nonEmpty) {
+        // Skip blank lines and '#' comments, so these files can carry a header
+        // describing what they are. Matches the keep-list convention used by
+        // data/info/v9.keep*/ and gtsrc::SampleSubset::build.
+        if (trimmed.nonEmpty && !trimmed.startsWith("#")) {
           requestedRows += 1
           val token = tokenAt(trimmed, sampleCol, path)
           val idx =
@@ -1329,7 +1416,7 @@ object LSeqVdsSparseExtract {
   ): Unit =
     outPrefix.foreach { prefix =>
       using(fs.create(prefix + ".variants.tsv")) { os =>
-        val header = "variant_index\tcontig\tposition\tref\talt\tminor_allele\tac\tan\taf\tmac\tmaf\tsc\n"
+        val header = "variant_index\tcontig\tposition\tref\talt\tminor_allele\tac\tan\taf\tmac\tmaf\tsc\tgnomad_ac\tgnomad_failed\n"
         os.write(header.getBytes("UTF-8"))
         retained.values.toIndexedSeq.sortBy(_.index).foreach { info =>
           variantCounts.get(info.index).foreach { counts =>
@@ -1341,7 +1428,7 @@ object LSeqVdsSparseExtract {
               val eventMaf = if (info.an == 0) 0.0 else eventMac.toDouble / info.an.toDouble
               val minorAllele = if (info.minorAlleleIndex == 0) "ref" else "alt"
               val line =
-                s"${info.index}\t${k.contig}\t${k.position}\t${k.ref}\t${k.alt}\t$minorAllele\t${info.ac}\t${info.an}\t${info.af}\t$eventMac\t$eventMaf\t${info.sc}\n"
+                s"${info.index}\t${k.contig}\t${k.position}\t${k.ref}\t${k.alt}\t$minorAllele\t${info.ac}\t${info.an}\t${info.af}\t$eventMac\t$eventMaf\t${info.sc}\t${info.gnomadAc}\t${if (info.gnomadFailed) "true" else "false"}\n"
               os.write(line.getBytes("UTF-8"))
             }
           }
